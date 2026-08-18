@@ -38,6 +38,7 @@ import {
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 
@@ -56,14 +57,234 @@ const GH_SETUP_INSTRUCTIONS =
 const PR_CHECKOUT_BLOCKED_BY_PENDING_CHANGES_MESSAGE =
 	"Cannot checkout PR: you have uncommitted changes. Please commit or stash them first.";
 
+export type ReviewTarget =
+	| { type: "uncommitted" }
+	| { type: "baseBranch"; branch: string }
+	| { type: "commit"; sha: string; title?: string }
+	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string }
+	| { type: "folder"; paths: string[] };
+
+export type PiReviewMode = "fresh" | "current";
+export type PiReviewVerdict = "correct" | "needs_attention" | "unknown";
+export type PiReviewEndAction = "return" | "summarize" | "fix";
+
+export const PI_REVIEW_STARTED_EVENT = "pi-review:started";
+export const PI_REVIEW_SETTLED_EVENT = "pi-review:settled";
+export const PI_REVIEW_ENDED_EVENT = "pi-review:ended";
+
+export type PiReviewStartedEvent = {
+	schemaVersion: 1;
+	reviewId: string;
+	target: ReviewTarget;
+	mode: PiReviewMode;
+	startedAt: string;
+	originId?: string;
+};
+
+export type PiReviewSettledEvent = {
+	schemaVersion: 1;
+	reviewId: string;
+	target: ReviewTarget;
+	mode: PiReviewMode;
+	verdict: PiReviewVerdict;
+	settledAt: string;
+	assistantMessageId?: string;
+	responseText?: string;
+};
+
+export type PiReviewEndedEvent = {
+	schemaVersion: 1;
+	reviewId: string;
+	target: ReviewTarget;
+	mode: "fresh";
+	action: PiReviewEndAction;
+	finalVerdict: PiReviewVerdict;
+	endedAt: string;
+};
+
 type ReviewSessionState = {
 	active: boolean;
 	originId?: string;
+	reviewId?: string;
+	target?: ReviewTarget;
+	mode?: PiReviewMode;
+	startedAt?: string;
+	latestVerdict?: PiReviewVerdict;
 };
 
 type ReviewSettingsState = {
 	customInstructions?: string;
 };
+
+export type ParsedReviewArgs = {
+	target: ReviewTarget | { type: "pr"; ref: string } | null;
+	extraInstruction?: string;
+	mode?: PiReviewMode;
+	error?: string;
+};
+
+type ParsedEndReviewAction = {
+	action?: PiReviewEndAction;
+	error?: string;
+};
+
+type AgentSettledExtensionAPI = {
+	on(
+		event: "agent_settled",
+		handler: (event: { type: "agent_settled" }, ctx: ExtensionContext) => Promise<void> | void,
+	): void;
+};
+
+function tokenizeArgs(value: string): string[] {
+	const tokens: string[] = [];
+	let current = "";
+	let quote: '"' | "'" | null = null;
+
+	for (let i = 0; i < value.length; i++) {
+		const char = value[i];
+
+		if (quote) {
+			if (char === "\\" && i + 1 < value.length) {
+				current += value[i + 1];
+				i += 1;
+				continue;
+			}
+			if (char === quote) {
+				quote = null;
+				continue;
+			}
+			current += char;
+			continue;
+		}
+
+		if (char === '"' || char === "'") {
+			quote = char;
+			continue;
+		}
+
+		if (/\s/.test(char)) {
+			if (current.length > 0) {
+				tokens.push(current);
+				current = "";
+			}
+			continue;
+		}
+
+		current += char;
+	}
+
+	if (current.length > 0) {
+		tokens.push(current);
+	}
+
+	return tokens;
+}
+
+function parseReviewPaths(value: string): string[] {
+	return value
+		.split(/\s+/)
+		.map((item) => item.trim())
+		.filter(Boolean);
+}
+
+export function parseReviewArgs(args: string | undefined): ParsedReviewArgs {
+	if (!args?.trim()) return { target: null };
+
+	const rawParts = tokenizeArgs(args.trim());
+	const parts: string[] = [];
+	let extraInstruction: string | undefined;
+	let mode: PiReviewMode | undefined;
+
+	for (let i = 0; i < rawParts.length; i++) {
+		const part = rawParts[i];
+		if (part === "--extra") {
+			const next = rawParts[i + 1];
+			if (!next) {
+				return { target: null, error: "Missing value for --extra" };
+			}
+			extraInstruction = next;
+			i += 1;
+			continue;
+		}
+
+		if (part.startsWith("--extra=")) {
+			extraInstruction = part.slice("--extra=".length);
+			continue;
+		}
+
+		if (part === "--fresh" || part === "--current") {
+			const requestedMode = part === "--fresh" ? "fresh" : "current";
+			if (mode && mode !== requestedMode) {
+				return { target: null, error: "--fresh and --current cannot be used together" };
+			}
+			mode = requestedMode;
+			continue;
+		}
+
+		parts.push(part);
+	}
+
+	if (parts.length === 0) {
+		return { target: null, extraInstruction, mode };
+	}
+
+	const subcommand = parts[0]?.toLowerCase();
+
+	switch (subcommand) {
+		case "uncommitted":
+			return { target: { type: "uncommitted" }, extraInstruction, mode };
+
+		case "branch": {
+			const branch = parts[1];
+			if (!branch) return { target: null, extraInstruction, mode };
+			return { target: { type: "baseBranch", branch }, extraInstruction, mode };
+		}
+
+		case "commit": {
+			const sha = parts[1];
+			if (!sha) return { target: null, extraInstruction, mode };
+			const title = parts.slice(2).join(" ") || undefined;
+			return { target: { type: "commit", sha, title }, extraInstruction, mode };
+		}
+
+		case "folder": {
+			const paths = parseReviewPaths(parts.slice(1).join(" "));
+			if (paths.length === 0) return { target: null, extraInstruction, mode };
+			return { target: { type: "folder", paths }, extraInstruction, mode };
+		}
+
+		case "pr": {
+			const ref = parts[1];
+			if (!ref) return { target: null, extraInstruction, mode };
+			return { target: { type: "pr", ref }, extraInstruction, mode };
+		}
+
+		default:
+			return { target: null, extraInstruction, mode };
+	}
+}
+
+export function parseEndReviewAction(args: string | undefined): ParsedEndReviewAction {
+	const value = args?.trim().toLowerCase();
+	if (!value) return {};
+	if (value === "return" || value === "summarize" || value === "fix") {
+		return { action: value };
+	}
+	return {
+		error: `Unknown /end-review action "${args?.trim()}". Expected return, summarize, or fix.`,
+	};
+}
+
+export function extractPiReviewVerdict(responseText: string | undefined): PiReviewVerdict {
+	if (typeof responseText !== "string") return "unknown";
+
+	const verdictLines = responseText
+		.split(/\r?\n/)
+		.filter((line) => line === "Overall verdict: correct" || line === "Overall verdict: needs attention");
+
+	if (verdictLines.length !== 1) return "unknown";
+	return verdictLines[0] === "Overall verdict: correct" ? "correct" : "needs_attention";
+}
 
 function setReviewWidget(ctx: ExtensionContext, active: boolean) {
 	if (!ctx.hasUI) return;
@@ -100,6 +321,12 @@ function getReviewState(ctx: ExtensionContext): ReviewSessionState | undefined {
 function applyReviewState(ctx: ExtensionContext) {
 	const state = getReviewState(ctx);
 
+	if (state?.active && state.mode === "current") {
+		reviewOriginId = undefined;
+		setReviewWidget(ctx, false);
+		return;
+	}
+
 	if (state?.active && state.originId) {
 		reviewOriginId = state.originId;
 		setReviewWidget(ctx, true);
@@ -108,6 +335,39 @@ function applyReviewState(ctx: ExtensionContext) {
 
 	reviewOriginId = undefined;
 	setReviewWidget(ctx, false);
+}
+
+function getLatestReviewAssistantResponse(
+	ctx: ExtensionContext,
+	reviewId: string,
+): { assistantMessageId?: string; responseText?: string } {
+	const branch = ctx.sessionManager.getBranch();
+	let reviewStateIndex = -1;
+
+	for (let i = 0; i < branch.length; i++) {
+		const entry = branch[i];
+		if (
+			entry.type === "custom" &&
+			entry.customType === REVIEW_STATE_TYPE &&
+			(entry.data as ReviewSessionState | undefined)?.reviewId === reviewId
+		) {
+			reviewStateIndex = i;
+		}
+	}
+
+	for (let i = branch.length - 1; i > reviewStateIndex; i--) {
+		const entry = branch[i];
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+
+		const textBlocks = entry.message.content.filter((content) => content.type === "text");
+		const responseText = textBlocks.map((content) => content.text).join("\n");
+		return {
+			assistantMessageId: entry.id,
+			responseText: responseText || undefined,
+		};
+	}
+
+	return {};
 }
 
 function getReviewSettings(ctx: ExtensionContext): ReviewSettingsState {
@@ -127,14 +387,6 @@ function applyReviewSettings(ctx: ExtensionContext) {
 	const state = getReviewSettings(ctx);
 	reviewCustomInstructions = state.customInstructions?.trim() || undefined;
 }
-
-// Review target types (matching Codex's approach)
-type ReviewTarget =
-	| { type: "uncommitted" }
-	| { type: "baseBranch"; branch: string }
-	| { type: "commit"; sha: string; title?: string }
-	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string }
-	| { type: "folder"; paths: string[] };
 
 // Prompts (adapted from Codex)
 const UNCOMMITTED_PROMPT =
@@ -268,7 +520,7 @@ Provide your findings in a clear, structured format:
 1. List each finding with its priority tag, file location, and explanation.
 2. Findings must reference locations that overlap with the actual diff — don't flag pre-existing code.
 3. Keep line references as short as possible (avoid ranges over 5-10 lines; pick the most suitable subrange).
-4. Provide an overall verdict: "correct" (no blocking issues) or "needs attention" (has blocking issues).
+4. Include exactly one standalone overall verdict line: \`Overall verdict: correct\` (no blocking issues) or \`Overall verdict: needs attention\` (has blocking issues).
 5. Ignore trivial style issues unless they obscure meaning or violate documented standards.
 6. Do not generate a full PR fix — only flag issues and optionally provide short suggestion blocks.
 7. End with the required "Human Reviewer Callouts (Non-Blocking)" section and all applicable bold callouts (no yes/no).
@@ -664,6 +916,41 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		applyAllReviewState(ctx);
 	});
 
+	(pi as ExtensionAPI & AgentSettledExtensionAPI).on("agent_settled", (_event, ctx) => {
+		if (endReviewInProgress) return;
+
+		const state = getReviewState(ctx);
+		if (
+			!state?.active ||
+			!state.reviewId ||
+			!state.target ||
+			!state.mode ||
+			!state.startedAt
+		) {
+			return;
+		}
+
+		const { assistantMessageId, responseText } = getLatestReviewAssistantResponse(ctx, state.reviewId);
+		const verdict = extractPiReviewVerdict(responseText);
+		const settledEvent: PiReviewSettledEvent = {
+			schemaVersion: 1,
+			reviewId: state.reviewId,
+			target: state.target,
+			mode: state.mode,
+			verdict,
+			settledAt: new Date().toISOString(),
+			...(assistantMessageId ? { assistantMessageId } : {}),
+			...(responseText ? { responseText } : {}),
+		};
+
+		pi.appendEntry(REVIEW_STATE_TYPE, {
+			...state,
+			active: state.mode === "fresh",
+			latestVerdict: verdict,
+		} satisfies ReviewSessionState);
+		pi.events.emit(PI_REVIEW_SETTLED_EVENT, settledEvent);
+	});
+
 	/**
 	 * Determine the smart default review type based on git state
 	 */
@@ -1031,14 +1318,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		return { type: "commit", sha: result.sha, title: result.title };
 	}
 
-
-	function parseReviewPaths(value: string): string[] {
-		return value
-			.split(/\s+/)
-			.map((item) => item.trim())
-			.filter((item) => item.length > 0);
-	}
-
 	/**
 	 * Show folder input
 	 */
@@ -1091,6 +1370,8 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			return false;
 		}
 
+		let reviewOriginForEvent: string | undefined;
+
 		// Handle fresh session mode
 		if (useFreshSession) {
 			// Store current position (where we'll return to).
@@ -1138,12 +1419,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 			// Restore origin after navigation events (session_tree can reset it)
 			reviewOriginId = lockedOriginId;
+			reviewOriginForEvent = lockedOriginId;
 
 			// Show widget indicating review is active
 			setReviewWidget(ctx, true);
-
-			// Persist review state so tree navigation can restore/reset it
-			pi.appendEntry(REVIEW_STATE_TYPE, { active: true, originId: lockedOriginId });
 		}
 
 		const prompt = await buildReviewPrompt(pi, target);
@@ -1168,132 +1447,29 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		const modeHint = useFreshSession ? " (fresh session)" : "";
 		ctx.ui.notify(`Starting review: ${hint}${modeHint}`, "info");
 
+		const mode: PiReviewMode = useFreshSession ? "fresh" : "current";
+		const startedEvent: PiReviewStartedEvent = {
+			schemaVersion: 1,
+			reviewId: randomUUID(),
+			target,
+			mode,
+			startedAt: new Date().toISOString(),
+			...(reviewOriginForEvent ? { originId: reviewOriginForEvent } : {}),
+		};
+
+		pi.appendEntry(REVIEW_STATE_TYPE, {
+			active: true,
+			originId: reviewOriginForEvent,
+			reviewId: startedEvent.reviewId,
+			target,
+			mode,
+			startedAt: startedEvent.startedAt,
+		} satisfies ReviewSessionState);
+		pi.events.emit(PI_REVIEW_STARTED_EVENT, startedEvent);
+
 		// Send as a user message that triggers a turn
 		pi.sendUserMessage(fullPrompt);
 		return true;
-	}
-
-	/**
-	 * Parse command arguments for direct invocation
-	 * Returns the target or a special marker for PR that needs async handling
-	 */
-	type ParsedReviewArgs = {
-		target: ReviewTarget | { type: "pr"; ref: string } | null;
-		extraInstruction?: string;
-		error?: string;
-	};
-
-	function tokenizeArgs(value: string): string[] {
-		const tokens: string[] = [];
-		let current = "";
-		let quote: '"' | "'" | null = null;
-
-		for (let i = 0; i < value.length; i++) {
-			const char = value[i];
-
-			if (quote) {
-				if (char === "\\" && i + 1 < value.length) {
-					current += value[i + 1];
-					i += 1;
-					continue;
-				}
-				if (char === quote) {
-					quote = null;
-					continue;
-				}
-				current += char;
-				continue;
-			}
-
-			if (char === '"' || char === "'") {
-				quote = char;
-				continue;
-			}
-
-			if (/\s/.test(char)) {
-				if (current.length > 0) {
-					tokens.push(current);
-					current = "";
-				}
-				continue;
-			}
-
-			current += char;
-		}
-
-		if (current.length > 0) {
-			tokens.push(current);
-		}
-
-		return tokens;
-	}
-
-	function parseArgs(args: string | undefined): ParsedReviewArgs {
-		if (!args?.trim()) return { target: null };
-
-		const rawParts = tokenizeArgs(args.trim());
-		const parts: string[] = [];
-		let extraInstruction: string | undefined;
-
-		for (let i = 0; i < rawParts.length; i++) {
-			const part = rawParts[i];
-			if (part === "--extra") {
-				const next = rawParts[i + 1];
-				if (!next) {
-					return { target: null, error: "Missing value for --extra" };
-				}
-				extraInstruction = next;
-				i += 1;
-				continue;
-			}
-
-			if (part.startsWith("--extra=")) {
-				extraInstruction = part.slice("--extra=".length);
-				continue;
-			}
-
-			parts.push(part);
-		}
-
-		if (parts.length === 0) {
-			return { target: null, extraInstruction };
-		}
-
-		const subcommand = parts[0]?.toLowerCase();
-
-		switch (subcommand) {
-			case "uncommitted":
-				return { target: { type: "uncommitted" }, extraInstruction };
-
-			case "branch": {
-				const branch = parts[1];
-				if (!branch) return { target: null, extraInstruction };
-				return { target: { type: "baseBranch", branch }, extraInstruction };
-			}
-
-			case "commit": {
-				const sha = parts[1];
-				if (!sha) return { target: null, extraInstruction };
-				const title = parts.slice(2).join(" ") || undefined;
-				return { target: { type: "commit", sha, title }, extraInstruction };
-			}
-
-
-			case "folder": {
-				const paths = parseReviewPaths(parts.slice(1).join(" "));
-				if (paths.length === 0) return { target: null, extraInstruction };
-				return { target: { type: "folder", paths }, extraInstruction };
-			}
-
-			case "pr": {
-				const ref = parts[1];
-				if (!ref) return { target: null, extraInstruction };
-				return { target: { type: "pr", ref }, extraInstruction };
-			}
-
-			default:
-				return { target: null, extraInstruction };
-		}
 	}
 
 	/**
@@ -1329,12 +1505,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			let target: ReviewTarget | null = null;
 			let fromSelector = false;
 			let extraInstruction: string | undefined;
-			const parsed = parseArgs(args);
+			const parsed = parseReviewArgs(args);
 			if (parsed.error) {
 				ctx.ui.notify(parsed.error, "error");
 				return;
 			}
 			extraInstruction = parsed.extraInstruction?.trim() || undefined;
+			const requestedMode = parsed.mode;
 
 			if (parsed.target) {
 				if (parsed.target.type === "pr") {
@@ -1368,10 +1545,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				const entries = ctx.sessionManager.getEntries();
 				const messageCount = entries.filter((e) => e.type === "message").length;
 
-				// In an empty session, default to fresh review mode so /end-review works consistently.
-				let useFreshSession = messageCount === 0;
+				// Explicit modes bypass the mode selector. Without one, preserve the existing default.
+				let useFreshSession = requestedMode ? requestedMode === "fresh" : messageCount === 0;
 
-				if (messageCount > 0) {
+				if (!requestedMode && messageCount > 0) {
 					// Existing session - ask user which mode they want
 					const choice = await ctx.ui.select("Start review in:", ["Empty branch", "Current session"]);
 
@@ -1457,6 +1634,18 @@ Instructions:
 		notifySuccess?: boolean;
 	};
 
+	function toInternalEndReviewAction(action: PiReviewEndAction): EndReviewAction {
+		if (action === "fix") return "returnAndFix";
+		if (action === "summarize") return "returnAndSummarize";
+		return "returnOnly";
+	}
+
+	function toPublicEndReviewAction(action: EndReviewAction): PiReviewEndAction {
+		if (action === "returnAndFix") return "fix";
+		if (action === "returnAndSummarize") return "summarize";
+		return "return";
+	}
+
 	function getActiveReviewOrigin(ctx: ExtensionContext): string | undefined {
 		if (reviewOriginId) {
 			return reviewOriginId;
@@ -1468,6 +1657,11 @@ Instructions:
 			return reviewOriginId;
 		}
 
+		if (state?.active && state.mode === "current") {
+			ctx.ui.notify("Current-session reviews do not have a review branch to return from.", "info");
+			return undefined;
+		}
+
 		if (state?.active) {
 			setReviewWidget(ctx, false);
 			pi.appendEntry(REVIEW_STATE_TYPE, { active: false });
@@ -1477,10 +1671,37 @@ Instructions:
 		return undefined;
 	}
 
-	function clearReviewState(ctx: ExtensionContext) {
+	function clearReviewState(ctx: ExtensionContext): boolean {
 		setReviewWidget(ctx, false);
 		reviewOriginId = undefined;
 		pi.appendEntry(REVIEW_STATE_TYPE, { active: false });
+		return getReviewState(ctx)?.active !== true;
+	}
+
+	function emitReviewEnded(
+		ctx: ExtensionContext,
+		state: ReviewSessionState | undefined,
+		action: EndReviewAction,
+	) {
+		if (
+			getReviewState(ctx)?.active === true ||
+			state?.mode !== "fresh" ||
+			!state.reviewId ||
+			!state.target
+		) {
+			return;
+		}
+
+		const endedEvent: PiReviewEndedEvent = {
+			schemaVersion: 1,
+			reviewId: state.reviewId,
+			target: state.target,
+			mode: "fresh",
+			action: toPublicEndReviewAction(action),
+			finalVerdict: state.latestVerdict ?? "unknown",
+			endedAt: new Date().toISOString(),
+		};
+		pi.events.emit(PI_REVIEW_ENDED_EVENT, endedEvent);
 	}
 
 	async function navigateWithSummary(
@@ -1521,6 +1742,7 @@ Instructions:
 		action: EndReviewAction,
 		options: EndReviewActionOptions = {},
 	): Promise<EndReviewActionResult> {
+		const reviewState = getReviewState(ctx);
 		const originId = getActiveReviewOrigin(ctx);
 		if (!originId) {
 			if (!getReviewState(ctx)?.active) {
@@ -1543,10 +1765,11 @@ Instructions:
 				return "error";
 			}
 
-			clearReviewState(ctx);
+			if (!clearReviewState(ctx)) return "error";
 			if (notifySuccess) {
 				ctx.ui.notify("Review complete! Returned to original position.", "info");
 			}
+			emitReviewEnded(ctx, reviewState, action);
 			return "ok";
 		}
 
@@ -1566,7 +1789,7 @@ Instructions:
 			return "cancelled";
 		}
 
-		clearReviewState(ctx);
+		if (!clearReviewState(ctx)) return "error";
 
 		if (action === "returnAndSummarize") {
 			if (!ctx.ui.getEditorText().trim()) {
@@ -1575,6 +1798,7 @@ Instructions:
 			if (notifySuccess) {
 				ctx.ui.notify("Review complete! Returned and summarized.", "info");
 			}
+			emitReviewEnded(ctx, reviewState, action);
 			return "ok";
 		}
 
@@ -1582,10 +1806,11 @@ Instructions:
 		if (notifySuccess) {
 			ctx.ui.notify("Review complete! Returned and queued a follow-up to fix findings.", "info");
 		}
+		emitReviewEnded(ctx, reviewState, action);
 		return "ok";
 	}
 
-	async function runEndReview(ctx: ExtensionCommandContext): Promise<void> {
+	async function runEndReview(ctx: ExtensionCommandContext, args?: string): Promise<void> {
 		if (!ctx.hasUI) {
 			ctx.ui.notify("End-review requires interactive mode", "error");
 			return;
@@ -1599,6 +1824,20 @@ Instructions:
 
 		endReviewInProgress = true;
 		try {
+			const parsedAction = parseEndReviewAction(args);
+			if (parsedAction.error) {
+				ctx.ui.notify(parsedAction.error, "error");
+				return;
+			}
+
+			if (parsedAction.action) {
+				await executeEndReviewAction(ctx, toInternalEndReviewAction(parsedAction.action), {
+					showSummaryLoader: true,
+					notifySuccess: true,
+				});
+				return;
+			}
+
 			const choice = await ctx.ui.select("Finish review:", [
 				"Return only",
 				"Return and fix findings",
@@ -1629,8 +1868,8 @@ Instructions:
 	// Register the /end-review command
 	pi.registerCommand("end-review", {
 		description: "Complete review and return to original position",
-		handler: async (_args, ctx) => {
-			await runEndReview(ctx);
+		handler: async (args, ctx) => {
+			await runEndReview(ctx, args);
 		},
 	});
 }
